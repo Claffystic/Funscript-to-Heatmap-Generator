@@ -11,8 +11,10 @@ python funscript2png <filename>.funscript out.png
 
 ### Preview
 Heatmap:
+<img width="1200" height="290" alt="image" src="https://github.com/user-attachments/assets/a9b7ac72-3cf3-4f6d-878b-bd2f9b3e3378" />
 
 In Yazi:
+<img width="1919" height="1015" alt="image" src="https://github.com/user-attachments/assets/89916970-7c29-4b07-a93b-3652dcdc8683" />
 
 ### Install for Yazi Preview (Linux)
 1. `git clone` or download the repo
