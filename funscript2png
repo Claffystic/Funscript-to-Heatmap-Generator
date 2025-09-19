@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+# funscript2png – heat-map preview generator for Yazi
+import json, sys, pathlib, numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# ---------- tweakables ----------
+IMG_H = 60
+LINE_WIDTH = 2
+COLOR_SMOOTHING = 5
+MAX_WIDTH = 1200  # Split into multiple rows if wider than this
+ROW_SPACING = 10  # Pixels between rows
+TEXT_SIZE = 12  # Font size for overlays
+TEXT_MARGIN = 20  # Extra space at bottom for text
+# --------------------------------
+
+# Colors from Lucifie (matching the TypeScript reference)
+HEATMAP_COLORS = [
+    [0, 0, 0],           # Black
+    [30, 144, 255],      # Dodger Blue
+    [34, 139, 34],       # Forest Green
+    [255, 215, 0],       # Gold
+    [220, 20, 60],       # Crimson
+    [147, 112, 219],     # Medium Slate Blue
+    [37, 22, 122],       # Dark Slate Blue
+]
+
+def lerp_color(color_a, color_b, t):
+    """Linear interpolation between two colors"""
+    return [int(color_a[i] + (color_b[i] - color_a[i]) * t) for i in range(3)]
+
+def get_color(intensity):
+    """Convert intensity to heatmap color (matching TypeScript logic)"""
+    step_size = 120
+    if intensity <= 0:
+        return HEATMAP_COLORS[0]
+    if intensity > 5 * step_size:
+        return HEATMAP_COLORS[6]
+    
+    intensity += step_size / 2.0
+    
+    try:
+        color_index = int(intensity / step_size)
+        next_color_index = min(color_index + 1, len(HEATMAP_COLORS) - 1)
+        
+        # Calculate interpolation factor
+        t = max(0.0, min(1.0, (intensity - color_index * step_size) / step_size))
+        
+        return lerp_color(HEATMAP_COLORS[color_index], HEATMAP_COLORS[next_color_index], t)
+    except:
+        return [0, 0, 0]
+
+def get_speed(prev_action, curr_action):
+    """Calculate speed between two actions (matching TypeScript logic)"""
+    if prev_action["at"] == curr_action["at"]:
+        return 0
+    time_diff = (curr_action["at"] - prev_action["at"]) / 1000.0  # Convert to seconds
+    pos_diff = abs(curr_action["pos"] - prev_action["pos"])
+    return pos_diff / time_diff if time_diff > 0 else 0
+
+def get_average_color(colors):
+    """Get average of a list of colors"""
+    if not colors:
+        return [0, 0, 0]
+    color_sum = [0, 0, 0]
+    for color in colors:
+        for i in range(3):
+            color_sum[i] += color[i]
+    return [int(color_sum[i] / len(colors)) for i in range(3)]
+
+def format_duration(duration_ms):
+    """Convert milliseconds to MM:SS format"""
+    total_seconds = int(duration_ms / 1000)
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    return f"{minutes}:{seconds:02d}"
+
+def get_font():
+    """Get a font for text overlay, with fallbacks"""
+    try:
+        # Try to use a common system font
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", TEXT_SIZE)
+    except:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", TEXT_SIZE)
+        except:
+            try:
+                return ImageFont.truetype("/System/Library/Fonts/Arial.ttf", TEXT_SIZE)
+            except:
+                try:
+                    return ImageFont.truetype("arial.ttf", TEXT_SIZE)
+                except:
+                    # Fallback to default font
+                    return ImageFont.load_default()
+    """Get average of a list of colors"""
+    if not colors:
+        return [0, 0, 0]
+    color_sum = [0, 0, 0]
+    for color in colors:
+        for i in range(3):
+            color_sum[i] += color[i]
+    return [int(color_sum[i] / len(colors)) for i in range(3)]
+
+def main():
+    if len(sys.argv) != 3:
+        sys.exit("usage: funscript2png input.funscript output.png")
+
+    in_file = pathlib.Path(sys.argv[1])
+    out_file = pathlib.Path(sys.argv[2])
+
+    data = json.loads(in_file.read_text())
+    actions = sorted(data["actions"], key=lambda x: x["at"])
+    
+    if len(actions) < 2:
+        # Create a black image for empty or single-action scripts
+        img = Image.new("RGB", (400, IMG_H), (0, 0, 0))
+        img.save(out_file, "PNG")
+        return
+
+    duration = actions[-1]["at"]
+    base_width = max(len(actions), 800)
+    
+    # Calculate how many rows we need
+    if base_width <= MAX_WIDTH:
+        # Single row
+        final_width = base_width
+        final_height = IMG_H + TEXT_MARGIN  # Add space for text
+        rows = 1
+        row_width = base_width
+    else:
+        # Multiple rows
+        rows = (base_width + MAX_WIDTH - 1) // MAX_WIDTH  # Ceiling division
+        row_width = MAX_WIDTH
+        final_width = row_width
+        final_height = rows * IMG_H + (rows - 1) * ROW_SPACING + TEXT_MARGIN  # Add space for text
+    
+    img = Image.new("RGB", (final_width, final_height), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    # First pass: calculate smoothed colors for each x position in the full timeline
+    pixel_colors = {}
+    
+    for x in range(base_width):
+        # Calculate time bounds for this pixel
+        pixel_time_min = (x / base_width) * duration
+        pixel_time_max = ((x + 1) / base_width) * duration
+        pixel_time_mid = (pixel_time_min + pixel_time_max) / 2
+        
+        # Find actions within this pixel's time range
+        current_pixel_actions = []
+        for i in range(1, len(actions)):
+            if (actions[i-1]["at"] <= pixel_time_max and actions[i]["at"] >= pixel_time_min):
+                current_pixel_actions.append((actions[i-1], actions[i]))
+        
+        # Calculate average speed for this pixel
+        if current_pixel_actions:
+            speed_sum = sum(get_speed(prev, curr) for prev, curr in current_pixel_actions)
+            avg_speed = speed_sum / len(current_pixel_actions)
+        else:
+            # Find closest action pair for this time
+            avg_speed = 0
+            for i in range(1, len(actions)):
+                if actions[i]["at"] > pixel_time_mid:
+                    avg_speed = get_speed(actions[i-1], actions[i])
+                    break
+        
+        pixel_colors[x] = get_color(avg_speed)
+    
+    # Apply color smoothing
+    smoothed_colors = {}
+    color_average = []
+    
+    for x in range(base_width):
+        if len(color_average) == COLOR_SMOOTHING:
+            color_average.pop(0)
+        if x in pixel_colors:
+            color_average.append(pixel_colors[x])
+        
+        if color_average:
+            smoothed_colors[x] = get_average_color(color_average)
+        else:
+            smoothed_colors[x] = [0, 0, 0]
+    
+    # Helper function to convert timeline coordinates to image coordinates
+    def timeline_to_image_coords(time, pos):
+        # Calculate which pixel in the timeline this corresponds to
+        timeline_x = int((time / duration) * base_width)
+        
+        # Calculate which row this pixel falls into
+        row = timeline_x // row_width
+        x_in_row = timeline_x % row_width
+        
+        # Calculate final image coordinates
+        final_x = x_in_row
+        final_y = row * (IMG_H + ROW_SPACING) + int((1 - pos / 100) * IMG_H)
+        
+        return final_x, final_y
+    
+    # Second pass: draw the actual funscript lines with heatmap colors
+    for i in range(1, len(actions)):
+        prev_action = actions[i-1]
+        curr_action = actions[i]
+        
+        # Calculate line coordinates
+        x1, y1 = timeline_to_image_coords(prev_action["at"], prev_action["pos"])
+        x2, y2 = timeline_to_image_coords(curr_action["at"], curr_action["pos"])
+        
+        # Check if line crosses row boundaries
+        prev_timeline_x = int((prev_action["at"] / duration) * base_width)
+        curr_timeline_x = int((curr_action["at"] / duration) * base_width)
+        prev_row = prev_timeline_x // row_width
+        curr_row = curr_timeline_x // row_width
+        
+        # Get the color for the midpoint of this line segment
+        mid_timeline_x = (prev_timeline_x + curr_timeline_x) // 2
+        if mid_timeline_x in smoothed_colors:
+            color = tuple(smoothed_colors[mid_timeline_x])
+        else:
+            color = (0, 0, 0)
+        
+        if prev_row == curr_row:
+            # Line stays in same row
+            draw.line([(x1, y1), (x2, y2)], fill=color, width=LINE_WIDTH)
+        else:
+            # Line crosses rows - split it
+            # Draw line to end of first row
+            row_end_x = row_width - 1
+            row_end_timeline_x = (prev_row + 1) * row_width - 1
+            row_end_time = (row_end_timeline_x / base_width) * duration
+            
+            # Interpolate position at row boundary
+            time_progress = (row_end_time - prev_action["at"]) / (curr_action["at"] - prev_action["at"]) if curr_action["at"] != prev_action["at"] else 0
+            row_end_pos = prev_action["pos"] + (curr_action["pos"] - prev_action["pos"]) * time_progress
+            
+            _, row_end_y = timeline_to_image_coords(row_end_time, row_end_pos)
+            draw.line([(x1, y1), (row_end_x, row_end_y)], fill=color, width=LINE_WIDTH)
+            
+            # Draw line from start of next row
+            row_start_x = 0
+            row_start_timeline_x = curr_row * row_width
+            row_start_time = (row_start_timeline_x / base_width) * duration
+            
+            time_progress = (row_start_time - prev_action["at"]) / (curr_action["at"] - prev_action["at"]) if curr_action["at"] != prev_action["at"] else 1
+            row_start_pos = prev_action["pos"] + (curr_action["pos"] - prev_action["pos"]) * time_progress
+            
+            _, row_start_y = timeline_to_image_coords(row_start_time, row_start_pos)
+            draw.line([(row_start_x, row_start_y), (x2, y2)], fill=color, width=LINE_WIDTH)
+    
+    # Add text overlays at the bottom (with error handling)
+    try:
+        font = get_font()
+        
+        # Prepare text
+        action_text = f"Actions: {len(actions)}"
+        duration_text = f"Length: {format_duration(duration)}"
+        
+        # Calculate text positions - place in the reserved text area
+        graph_bottom = final_height - TEXT_MARGIN  # Bottom of the graph area
+        text_y = graph_bottom + 5  # 5px below the graph
+        
+        # Left text (Actions)
+        draw.text((5, text_y), action_text, fill=(255, 255, 255), font=font)
+        
+        # Right text (Length) - calculate width to right-align
+        try:
+            # For newer PIL versions
+            bbox = draw.textbbox((0, 0), duration_text, font=font)
+            text_width = bbox[2] - bbox[0]
+        except AttributeError:
+            try:
+                # Fallback for older PIL versions
+                text_width = draw.textsize(duration_text, font=font)[0]
+            except:
+                # If textsize also fails, estimate width
+                text_width = len(duration_text) * 7  # Rough estimation
+        
+        draw.text((final_width - text_width - 5, text_y), duration_text, fill=(255, 255, 255), font=font)
+        
+    except Exception as e:
+        # If text overlay fails, continue without it - don't break the whole preview
+        pass
+    
+    img.save(out_file, "PNG")
+    sys.stdout.flush()
+
+if __name__ == "__main__":
+    main()
